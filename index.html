@@ -1,0 +1,1089 @@
+<!doctype html>
+<!--
+  Photo Polish — a small, friendly photo editor in one file.
+
+  HOW TO OPEN
+    • Double-click index.html. It opens in your browser and works offline.
+    • Or serve the folder and open it on any device on the same Wi-Fi:
+        python3 -m http.server 8000
+      then visit http://localhost:8000 (or http://<this-computer's-IP>:8000 on your phone).
+
+  WHAT IT DOES
+    Pick a photo, tap a one-tap look or fine-tune the sliders, crop/rotate, then Save a JPEG.
+    Everything happens on your device: no network calls, no tracking, no dependencies.
+
+  CODE MAP (search for these headings)
+    1. Config & state        4. Geometry (rotate / flip / crop)   7. History (undo / redo)
+    2. Image processing      5. loadImage()                       8. UI bindings
+    3. Presets & Auto        6. render()                          9. exportJpeg()
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1012">
+<title>Photo Polish</title>
+<style>
+  :root {
+    --bg: #0f1012;
+    --panel: #17181b;
+    --panel-2: #202125;
+    --line: #2b2d32;
+    --text: #ececee;
+    --muted: #9b9da4;
+    --accent: #f2c14e;
+    --accent-ink: #1b1405;
+    --radius: 12px;
+    --panel-w: 400px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior: none;
+  }
+  button, label.btn { font: inherit; color: inherit; }
+  [hidden] { display: none !important; }
+
+  /* ---------- Layout: photo on top, panel at the bottom (mobile) or right (desktop) ---------- */
+  #app {
+    height: 100vh; height: 100dvh;
+    display: grid; overflow: hidden;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    grid-template-areas: "top" "stage" "panel";
+  }
+  @media (min-width: 900px) {
+    #app {
+      grid-template-columns: minmax(0, 1fr) var(--panel-w);
+      grid-template-rows: auto minmax(0, 1fr);
+      grid-template-areas: "top top" "stage panel";
+    }
+  }
+
+  /* ---------- Top bar ---------- */
+  .topbar {
+    grid-area: top; display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; padding-top: max(8px, env(safe-area-inset-top));
+    border-bottom: 1px solid var(--line); background: var(--bg);
+  }
+  .brand { font-weight: 650; letter-spacing: .2px; margin-right: auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .btn {
+    min-height: 44px; min-width: 44px; padding: 0 16px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    border-radius: 999px; border: 1px solid var(--line); background: var(--panel-2);
+    cursor: pointer; user-select: none; -webkit-user-select: none;
+  }
+  .btn:hover { border-color: #3a3d44; }
+  .btn:active { transform: scale(.97); }
+  .btn:disabled { opacity: .35; cursor: default; transform: none; }
+  .btn.icon { padding: 0; width: 44px; }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 650; }
+  .btn svg { width: 20px; height: 20px; }
+  body:not(.has-image) .needs-image { display: none !important; }
+
+  /* ---------- Stage (the photo) ---------- */
+  .stage {
+    grid-area: stage; position: relative; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    padding: 12px;
+  }
+  #view {
+    display: block; max-width: 100%; max-height: 100%;
+    border-radius: 4px; box-shadow: 0 8px 30px rgba(0,0,0,.45);
+    touch-action: none;
+  }
+  .dropzone {
+    width: min(440px, 100%); padding: 32px 20px; text-align: center;
+    border: 2px dashed var(--line); border-radius: 20px;
+  }
+  .dropzone.over { border-color: var(--accent); background: rgba(242,193,78,.06); }
+  .dropzone h1 { font-size: 22px; margin: 0 0 6px; font-weight: 650; }
+  .dropzone p { color: var(--muted); margin: 0 0 20px; }
+  .dropzone .btn.primary { min-height: 52px; padding: 0 28px; font-size: 17px; }
+  .dropzone small { display: block; margin-top: 16px; color: var(--muted); }
+
+  .compare {
+    position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
+    background: rgba(20,21,24,.82); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    touch-action: none; -webkit-touch-callout: none;
+  }
+  .compare.active { background: var(--accent); color: var(--accent-ink); }
+  .badge {
+    position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,.65); padding: 4px 12px; border-radius: 999px; font-size: 13px;
+  }
+
+  /* Crop frame: everything outside it is dimmed by the giant shadow */
+  .cropbox {
+    position: absolute; border: 2px solid #fff; cursor: move; touch-action: none;
+    box-shadow: 0 0 0 9999px rgba(0,0,0,.6);
+    background:
+      linear-gradient(to right, transparent calc(33.33% - .5px), rgba(255,255,255,.45) calc(33.33% - .5px), rgba(255,255,255,.45) calc(33.33% + .5px), transparent calc(33.33% + .5px), transparent calc(66.66% - .5px), rgba(255,255,255,.45) calc(66.66% - .5px), rgba(255,255,255,.45) calc(66.66% + .5px), transparent calc(66.66% + .5px)),
+      linear-gradient(to bottom, transparent calc(33.33% - .5px), rgba(255,255,255,.45) calc(33.33% - .5px), rgba(255,255,255,.45) calc(33.33% + .5px), transparent calc(33.33% + .5px), transparent calc(66.66% - .5px), rgba(255,255,255,.45) calc(66.66% - .5px), rgba(255,255,255,.45) calc(66.66% + .5px), transparent calc(66.66% + .5px));
+  }
+  .cropbox.fixed { cursor: default; }
+
+  /* ---------- Panel ---------- */
+  .panel {
+    grid-area: panel; display: flex; flex-direction: column; min-height: 0;
+    background: var(--panel); border-top: 1px solid var(--line);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  @media (min-width: 900px) { .panel { border-top: 0; border-left: 1px solid var(--line); } }
+  .tabs {
+    display: flex; gap: 4px; padding: 6px 8px; overflow-x: auto; scrollbar-width: none;
+    border-bottom: 1px solid var(--line);
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab {
+    flex: 1 0 auto; min-height: 44px; padding: 0 9px; border: 0; border-radius: 10px;
+    background: transparent; color: var(--muted); cursor: pointer; font-weight: 550;
+  }
+  .tab[aria-selected="true"] { background: var(--panel-2); color: var(--text); }
+  .tab-body { overflow-y: auto; padding: 8px 16px 12px; max-height: 34vh; max-height: 34dvh; }
+  @media (min-width: 900px) { .tab-body { flex: 1; max-height: none; } }
+  .group-title { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; margin: 12px 0 6px; }
+
+  /* Looks: horizontal strip on mobile, grid on desktop */
+  .looks { display: flex; gap: 10px; overflow-x: auto; padding: 6px 0 4px; scrollbar-width: none; }
+  .looks::-webkit-scrollbar { display: none; }
+  @media (min-width: 900px) { .looks { display: grid; grid-template-columns: repeat(3, 1fr); overflow: visible; } }
+  .look {
+    flex: 0 0 84px; display: flex; flex-direction: column; align-items: center; gap: 6px;
+    padding: 4px; border: 2px solid transparent; border-radius: var(--radius); background: none;
+    cursor: pointer; font-size: 12px; color: var(--muted); text-align: center;
+  }
+  .look canvas { width: 72px; height: 72px; border-radius: 9px; background: var(--panel-2); display: block; }
+  @media (min-width: 900px) { .look canvas { width: 100%; height: auto; aspect-ratio: 1; } }
+  .look.active { border-color: var(--accent); color: var(--text); }
+
+  /* Sliders */
+  .slider { padding: 2px 0; }
+  .slider-head { display: flex; align-items: center; gap: 8px; }
+  .slider-head label { flex: 1; }
+  .slider-head output { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 3ch; text-align: right; }
+  .slider.changed output { color: var(--accent); }
+  .reset {
+    width: 36px; height: 36px; margin: -4px -8px -4px 0; border: 0; border-radius: 50%;
+    background: none; color: var(--muted); cursor: pointer; font-size: 17px; visibility: hidden;
+  }
+  .slider.changed .reset { visibility: visible; }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 100%; height: 36px;
+    background: transparent; margin: 0; cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: var(--line); }
+  input[type=range]::-moz-range-track { height: 4px; border-radius: 2px; background: var(--line); }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 26px; height: 26px; margin-top: -11px; border-radius: 50%;
+    background: #fff; border: 0; box-shadow: 0 1px 4px rgba(0,0,0,.5);
+  }
+  input[type=range]::-moz-range-thumb { width: 26px; height: 26px; border-radius: 50%; background: #fff; border: 0; }
+  input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+  .btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .btn-row .btn { flex: 1 1 0; padding: 0 10px; }
+  .btn.selected { border-color: var(--accent); color: var(--accent); }
+  .hint { color: var(--muted); font-size: 13px; margin: 12px 0 0; }
+
+  .panel-foot {
+    display: flex; align-items: center; gap: 12px; padding: 8px 16px;
+    border-top: 1px solid var(--line);
+  }
+  .quality { flex: 1; display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .quality output { min-width: 3ch; font-variant-numeric: tabular-nums; }
+
+  /* ---------- Busy + toast ---------- */
+  .busy {
+    position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; gap: 12px;
+    align-items: center; justify-content: center; background: rgba(0,0,0,.55);
+  }
+  .spinner {
+    width: 36px; height: 36px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,.25); border-top-color: #fff; animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(1turn); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
+  .toast {
+    position: fixed; z-index: 30; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom));
+    transform: translateX(-50%); max-width: calc(100% - 32px);
+    display: flex; align-items: center; gap: 12px;
+    background: #2a2b30; border: 1px solid var(--line); padding: 10px 10px 10px 16px; border-radius: 14px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.4);
+  }
+  .toast .btn { min-height: 36px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <span class="brand">Photo Polish</span>
+    <label class="btn needs-image" for="file">Open</label>
+    <button class="btn icon needs-image" id="undo" title="Undo (Ctrl/Cmd+Z)" aria-label="Undo" disabled>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>
+    </button>
+    <button class="btn icon needs-image" id="redo" title="Redo (Ctrl/Cmd+Shift+Z)" aria-label="Redo" disabled>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg>
+    </button>
+    <button class="btn primary needs-image" id="save">Save</button>
+  </header>
+
+  <main class="stage" id="stage">
+    <div class="dropzone" id="dropzone">
+      <h1>Make your photos look pro</h1>
+      <p>One-tap looks, simple sliders, and a clean JPEG out.</p>
+      <label class="btn primary" for="file">Choose photo</label>
+      <small>…or drop a photo here. It never leaves your device.</small>
+    </div>
+    <canvas id="view" hidden></canvas>
+    <div class="cropbox" id="cropBox" hidden></div>
+    <div class="badge" id="badge" hidden>Original</div>
+    <button class="btn compare needs-image" id="compare">Hold to compare</button>
+  </main>
+
+  <aside class="panel needs-image" id="panel">
+    <nav class="tabs" role="tablist" id="tabs">
+      <button class="tab" role="tab" data-tab="looks" aria-selected="true">Looks</button>
+      <button class="tab" role="tab" data-tab="light" aria-selected="false">Light</button>
+      <button class="tab" role="tab" data-tab="color" aria-selected="false">Color</button>
+      <button class="tab" role="tab" data-tab="detail" aria-selected="false">Detail</button>
+      <button class="tab" role="tab" data-tab="effects" aria-selected="false">Effects</button>
+      <button class="tab" role="tab" data-tab="crop" aria-selected="false">Crop</button>
+    </nav>
+    <div class="tab-body">
+      <section data-pane="looks"><div class="looks" id="looks"></div></section>
+      <section data-pane="light" hidden></section>
+      <section data-pane="color" hidden></section>
+      <section data-pane="detail" hidden></section>
+      <section data-pane="effects" hidden></section>
+      <section data-pane="crop" hidden>
+        <div class="group-title">Rotate &amp; flip</div>
+        <div class="btn-row">
+          <button class="btn" id="rotL">↺ Left</button>
+          <button class="btn" id="rotR">↻ Right</button>
+          <button class="btn" id="flipH">⇋ Flip</button>
+        </div>
+        <div class="group-title">Aspect ratio</div>
+        <div class="btn-row" id="ratios">
+          <button class="btn" data-ratio="original">Original</button>
+          <button class="btn" data-ratio="1:1">1:1</button>
+          <button class="btn" data-ratio="4:5">4:5</button>
+          <button class="btn" data-ratio="16:9">16:9</button>
+        </div>
+        <p class="hint">Drag the frame on the photo to choose what to keep.</p>
+      </section>
+    </div>
+    <div class="panel-foot">
+      <button class="btn" id="resetAll">Reset all</button>
+      <label class="quality">JPEG quality
+        <input type="range" id="quality" min="0.5" max="1" step="0.01" value="0.92" aria-label="JPEG quality">
+        <output id="qualityOut">92</output>
+      </label>
+    </div>
+  </aside>
+</div>
+
+<input type="file" id="file" accept="image/*" hidden>
+<div class="busy" id="busy" hidden><div class="spinner"></div><div id="busyText">Working…</div></div>
+<div class="toast" id="toast" role="status" hidden><span id="toastText"></span></div>
+
+<script>
+'use strict';
+
+/* =====================================================================
+   1. CONFIG & STATE
+   ===================================================================== */
+
+// Long side of the live preview. Smaller on phones so sliders stay responsive; export is always full size.
+const PREVIEW_MAX = window.matchMedia && matchMedia('(pointer: coarse)').matches ? 1200 : 1600;
+const MAX_EXPORT_PIXELS = 16.7e6;    // iOS Safari refuses canvases above ~16.7 MP
+const GRAIN_SEED = 0x5eed;           // fixed seed so grain looks the same in preview and export
+const HISTORY_LIMIT = 100;
+
+const DEFAULT_PARAMS = {
+  exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0,
+  temperature: 0, tint: 0, saturation: 0, vibrance: 0,
+  sharpness: 0, clarity: 0,
+  vignette: 0, grain: 0,
+};
+const DEFAULT_TOOLS = { rotate: 0, flipH: false, crop: { ratio: 'original', cx: 0.5, cy: 0.5 } };
+
+// Slider definitions: [tab, key, label, min, max]
+const SLIDERS = [
+  ['light',   'exposure',    'Exposure',    -100, 100],
+  ['light',   'contrast',    'Contrast',    -100, 100],
+  ['light',   'highlights',  'Highlights',  -100, 100],
+  ['light',   'shadows',     'Shadows',     -100, 100],
+  ['light',   'whites',      'Whites',      -100, 100],
+  ['light',   'blacks',      'Blacks',      -100, 100],
+  ['color',   'temperature', 'Temperature', -100, 100],
+  ['color',   'tint',        'Tint',        -100, 100],
+  ['color',   'saturation',  'Saturation',  -100, 100],
+  ['color',   'vibrance',    'Vibrance',    -100, 100],
+  ['detail',  'sharpness',   'Sharpness',      0, 100],
+  ['detail',  'clarity',     'Clarity',     -100, 100],
+  ['effects', 'vignette',    'Vignette',       0, 100],
+  ['effects', 'grain',       'Grain',          0, 100],
+];
+
+const state = {
+  params: { ...DEFAULT_PARAMS },
+  tools: clone(DEFAULT_TOOLS),
+  look: 'original',        // which one-tap look was last applied (for highlighting only)
+  history: [],             // JSON snapshots of {params, tools, look} — never pixels
+  index: -1,               // position in history
+};
+
+let img = null;            // { full: ImageBitmap|Canvas, preview: Canvas, name: string }
+let activeTab = 'looks';
+let comparing = false;
+let baseCache = {};        // geometry-applied preview pixels, keyed by mode
+let outCache = null;       // last processed preview, reused while nothing changed
+
+function clone(o) { return JSON.parse(JSON.stringify(o)); }
+function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
+function smoothstep(e0, e1, x) { const t = clamp((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); }
+function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+function ctx2d(c) { return c.getContext('2d', { willReadFrequently: true }); }
+
+/* =====================================================================
+   2. IMAGE PROCESSING  (pure: pixels + params in → new pixels out)
+   ===================================================================== */
+
+/**
+ * applyAdjustments(imageData, params, opts) → new ImageData
+ * opts.detailScale: how many times larger this image is than the preview
+ * (used so grain looks the same at export size as it did on screen).
+ */
+function applyAdjustments(src, params, opts = {}) {
+  const w = src.width, h = src.height;
+  const out = new ImageData(new Uint8ClampedArray(src.data), w, h);
+  const d = out.data;
+  const p = params;
+  // Helpers below mutate `d`, which this function owns, so the input is never touched.
+  tonePass(d, p);
+  if (p.clarity)   clarityPass(d, w, h, p.clarity / 100);
+  if (p.sharpness) sharpenPass(d, w, h, p.sharpness / 100);
+  if (p.vignette || p.grain) finishPass(d, w, h, p, opts.detailScale || 1);
+  return out;
+}
+
+/** One pass over every pixel for all the "per-pixel" adjustments. Values are worked on as 0..1. */
+function tonePass(d, p) {
+  // Temperature: warm = a little more red and less blue (cool is the reverse).
+  // Tint: positive = magenta (less green), negative = green.
+  const T = p.temperature / 100, G = p.tint / 100;
+  const wbR = 1 + 0.20 * T + 0.04 * G, wbG = 1 - 0.12 * G, wbB = 1 - 0.20 * T + 0.04 * G;
+
+  // Exposure: each 50 slider steps = one photographic stop (×2 brightness). Range ±2 stops.
+  const ex = Math.pow(2, p.exposure / 50) / 255;
+
+  // Contrast: stretch values away from mid-grey (0.5). k > 1 = more contrast.
+  const c = p.contrast / 100;
+  const k = c >= 0 ? 1 + c * 0.9 : 1 + c * 0.6;
+
+  // Shadows / highlights: brighten or darken only the dark (or bright) parts,
+  // using a smooth weight based on how bright each pixel is.
+  const sh = p.shadows / 100 * 0.32, hi = p.highlights / 100 * 0.35;
+
+  // Whites / blacks: move the white and black points (like Levels).
+  // +Blacks lifts the blacks (a faded, filmic look); +Whites makes bright areas brighter.
+  const bp = -p.blacks / 100 * 0.12, wp = 1 - p.whites / 100 * 0.15;
+  const ls = 1 / (wp - bp);
+
+  // Saturation scales all colour equally; vibrance boosts muted colours more than strong ones.
+  const sat = 1 + p.saturation / 100, vib = p.vibrance / 100;
+
+  const doK = k !== 1, doHS = sh !== 0 || hi !== 0, doLv = bp !== 0 || wp !== 1, doSat = sat !== 1 || vib !== 0;
+
+  for (let i = 0, n = d.length; i < n; i += 4) {
+    let r = d[i] * ex * wbR, g = d[i + 1] * ex * wbG, b = d[i + 2] * ex * wbB;
+
+    if (doK) { r = (r - 0.5) * k + 0.5; g = (g - 0.5) * k + 0.5; b = (b - 0.5) * k + 0.5; }
+
+    if (doHS) {
+      let L = 0.2126 * r + 0.7152 * g + 0.0722 * b;   // perceived brightness
+      L = L < 0 ? 0 : L > 1.5 ? 1.5 : L;
+      let t = L / 0.6; t = t > 1 ? 1 : t;
+      const ws = 1 - t * t * (3 - 2 * t);           // 1 in deep shadow → 0 by 60% brightness
+      let u = (L - 0.4) / 0.6; u = u < 0 ? 0 : u > 1 ? 1 : u;
+      const wh = u * u * (3 - 2 * u);               // 0 below 40% → 1 at white
+      // Multiply (rather than add) so true black stays black and colours keep their saturation.
+      const gain = 1 + sh * ws * 2.5 + hi * wh;
+      r *= gain; g *= gain; b *= gain;
+    }
+
+    if (doLv) { r = (r - bp) * ls; g = (g - bp) * ls; b = (b - bp) * ls; }
+
+    if (doSat) {
+      // Pull each channel towards (or push away from) the pixel's grey value.
+      const L = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+      const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+      let s = mx - mn; s = s < 0 ? 0 : s > 1 ? 1 : s;      // rough "how colourful is this pixel"
+      let f = sat * (1 + vib * (1 - s) * 0.9);
+      if (f < 0) f = 0;
+      r = L + (r - L) * f; g = L + (g - L) * f; b = L + (b - L) * f;
+    }
+
+    d[i] = r * 255; d[i + 1] = g * 255; d[i + 2] = b * 255;   // Uint8ClampedArray clamps + rounds
+  }
+}
+
+/** Fast box blur of a single-channel float image (two passes of running sums). */
+function boxBlur(src, w, h, r) {
+  const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+  const norm = 1 / (2 * r + 1);
+  for (let y = 0; y < h; y++) {                // horizontal
+    const row = y * w; let acc = 0;
+    for (let x = -r; x <= r; x++) acc += src[row + clamp(x, 0, w - 1)];
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = acc * norm;
+      acc += src[row + Math.min(x + r + 1, w - 1)] - src[row + Math.max(x - r, 0)];
+    }
+  }
+  for (let x = 0; x < w; x++) {                // vertical
+    let acc = 0;
+    for (let y = -r; y <= r; y++) acc += tmp[clamp(y, 0, h - 1) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = acc * norm;
+      acc += tmp[Math.min(y + r + 1, h - 1) * w + x] - tmp[Math.max(y - r, 0) * w + x];
+    }
+  }
+  return out;
+}
+
+/**
+ * Clarity = local contrast. Compare each pixel's brightness with a heavily blurred version
+ * of its neighbourhood and exaggerate (or soften) the difference, mostly in the mid-tones.
+ * The blur radius is relative to image size, so preview and export look the same.
+ */
+function clarityPass(d, w, h, amount) {
+  const n = w * h, L = new Float32Array(n);
+  for (let j = 0, i = 0; j < n; j++, i += 4) L[j] = (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+  const r = Math.max(2, Math.round(Math.min(w, h) / 40));
+  const B = boxBlur(boxBlur(L, w, h, r), w, h, r);     // two box blurs ≈ a soft Gaussian
+  for (let j = 0, i = 0; j < n; j++, i += 4) {
+    const m = L[j];
+    const midtone = 4 * m * (1 - m);                   // 1 at mid-grey, 0 at black/white
+    const delta = (m - B[j]) * amount * midtone * 1.4 * 255;
+    d[i] += delta; d[i + 1] += delta; d[i + 2] += delta;
+  }
+}
+
+/**
+ * Sharpness = 3×3 unsharp mask: blur each pixel with its 8 neighbours, then push the
+ * pixel away from that blur. Edges get crisper; flat areas barely change.
+ */
+function sharpenPass(d, w, h, amount) {
+  const src = new Uint8ClampedArray(d);
+  const a = amount * 1.6, row = w * 4;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = (y * w + x) * 4;
+      for (let c = 0; c < 3; c++) {
+        const k = i + c;
+        const blur = (src[k - row - 4] + src[k - row] + src[k - row + 4] +
+                      src[k - 4]       + src[k]       + src[k + 4] +
+                      src[k + row - 4] + src[k + row] + src[k + row + 4]) / 9;
+        d[k] = src[k] + a * (src[k] - blur);
+      }
+    }
+  }
+}
+
+/** Vignette mask (0 in the centre → 1 in the corners). Computed once per size and cached. */
+const vignetteCache = new Map();
+function vignetteMask(w, h) {
+  const key = w + 'x' + h;
+  if (vignetteCache.has(key)) return vignetteCache.get(key);
+  const m = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const dy = (y + 0.5) / h * 2 - 1;
+    for (let x = 0; x < w; x++) {
+      const dx = (x + 0.5) / w * 2 - 1;
+      const dist = Math.sqrt((dx * dx + dy * dy) / 2);   // 0 centre, 1 corner (follows the frame shape)
+      m[y * w + x] = smoothstep(0.35, 1.05, dist);
+    }
+  }
+  if (vignetteCache.size > 3) vignetteCache.delete(vignetteCache.keys().next().value);
+  vignetteCache.set(key, m);
+  return m;
+}
+
+/** Repeatable pseudo-random number in [0,1) for a pixel index (so grain doesn't flicker). */
+function hash01(i, seed) {
+  let h = Math.imul(i ^ seed, 0x85ebca6b);
+  h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+
+/** Vignette (darken towards the corners) and film grain (fine monochrome noise). */
+function finishPass(d, w, h, p, detailScale) {
+  const vig = p.vignette / 100 * 0.75;
+  // Grain is per pixel; on a larger export each grain is smaller, so scale its strength
+  // to keep the same visible texture as the preview.
+  const grain = p.grain / 100 * 26 * Math.min(Math.max(detailScale, 1), 4);
+  const mask = vig ? vignetteMask(w, h) : null;
+  for (let j = 0, i = 0, n = w * h; j < n; j++, i += 4) {
+    let r = d[i], g = d[i + 1], b = d[i + 2];
+    if (mask) { const f = 1 - vig * mask[j]; r *= f; g *= f; b *= f; }
+    if (grain) {
+      const L = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+      const noise = hash01(j, GRAIN_SEED) + hash01(j, GRAIN_SEED * 7 + 3) - 1;   // soft, centred on 0
+      const amt = noise * grain * (0.4 + 2.4 * L * (1 - L));                      // most visible in mid-tones
+      r += amt; g += amt; b += amt;
+    }
+    d[i] = r; d[i + 1] = g; d[i + 2] = b;
+  }
+}
+
+/* =====================================================================
+   3. PRESETS & AUTO ENHANCE  (each look is just slider values)
+   ===================================================================== */
+
+const LOOKS = [
+  { id: 'original', name: 'Original',        params: {} },
+  { id: 'auto',     name: 'Auto Enhance',    params: null },   // computed from the photo
+  { id: 'clean',    name: 'Clean & Bright',  params: { exposure: 12, contrast: 8, highlights: -30, shadows: 30, whites: 15, blacks: -5, temperature: -4, vibrance: 22, clarity: 10, sharpness: 20 } },
+  { id: 'warm',     name: 'Warm Portrait',   params: { exposure: 6, contrast: -4, highlights: -25, shadows: 18, temperature: 22, tint: 5, saturation: -6, vibrance: 12, clarity: -12, sharpness: 10, vignette: 22 } },
+  { id: 'moody',    name: 'Moody Contrast',  params: { exposure: -10, contrast: 38, highlights: -40, shadows: 8, whites: -10, blacks: -15, temperature: -8, saturation: -28, vibrance: 6, clarity: 30, sharpness: 25, vignette: 45 } },
+  { id: 'vivid',    name: 'Vivid Landscape', params: { contrast: 20, highlights: -35, shadows: 22, whites: 10, blacks: -10, temperature: 3, saturation: 14, vibrance: 40, clarity: 25, sharpness: 30 } },
+  { id: 'film',     name: 'Soft Film',       params: { contrast: -14, highlights: -15, whites: -15, blacks: 38, temperature: 8, tint: 3, saturation: -20, vibrance: 5, grain: 35, vignette: 15 } },
+];
+
+/**
+ * Auto Enhance: look at the brightness histogram and nudge the photo towards a
+ * well-exposed, punchy-but-natural result.
+ */
+function autoParams(imageData) {
+  const d = imageData.data, hist = new Uint32Array(256);
+  let sr = 0, sg = 0, sb = 0, count = 0;
+  for (let i = 0; i < d.length; i += 16) {            // every 4th pixel is plenty
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    hist[Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b)]++;
+    sr += r; sg += g; sb += b; count++;
+  }
+  const pct = q => { let acc = 0; const target = q * count; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= target) return v / 255; } return 1; };
+  const p2 = pct(0.02), p50 = pct(0.5), p98 = pct(0.98);
+  let clippedHi = 0, deepShadow = 0;
+  for (let v = 245; v < 256; v++) clippedHi += hist[v];
+  for (let v = 0; v < 25; v++) deepShadow += hist[v];
+
+  const out = {};
+  // Exposure: move the median brightness towards ~46% (a pleasant mid-tone), gently, max ±1 stop.
+  const ev = clamp(Math.log2(0.46 / Math.max(p50, 0.02)), -1, 1) * 0.7;
+  out.exposure = Math.round(ev * 50);
+  // Contrast: a flat photo (narrow brightness range) gets more contrast.
+  const range = p98 - p2;
+  out.contrast = Math.round(clamp((0.85 - range) * 70, -10, 30));
+  // Whites/blacks: stretch so the brightest and darkest bits reach near white/black.
+  out.whites = Math.round(clamp((0.96 - p98) * 250, 0, 35));
+  out.blacks = Math.round(clamp(-(p2 - 0.03) * 250, -30, 5));
+  // Recover blown highlights and open up crushed shadows if there are lots of them.
+  out.highlights = clippedHi / count > 0.02 ? -35 : -10;
+  out.shadows = deepShadow / count > 0.08 ? 25 : 8;
+  // Gentle white balance: if the photo is much bluer than red, warm it a little (and vice-versa).
+  const mean = (sr + sg + sb) / 3 || 1;
+  out.temperature = Math.round(clamp((sb - sr) / mean * 40, -12, 12));
+  out.vibrance = 25; out.saturation = 5; out.sharpness = 15;
+  return out;
+}
+
+function paramsForLook(id) {
+  const look = LOOKS.find(l => l.id === id);
+  const p = look.params || autoParams(getBase('cropped').data);
+  return { ...DEFAULT_PARAMS, ...p };
+}
+
+function applyPreset(id) {
+  if (!img) return;
+  state.params = paramsForLook(id);
+  state.look = id;
+  commit(); syncUI(); scheduleRender();
+}
+
+/* =====================================================================
+   4. GEOMETRY  (rotate / flip / crop — all done with canvas transforms)
+   ===================================================================== */
+
+const RATIOS = { original: null, '1:1': 1, '4:5': 4 / 5, '16:9': 16 / 9 };
+
+/** Largest rectangle of the chosen aspect ratio that fits, centred on (cx, cy). */
+function cropRect(W, H, crop) {
+  const r = RATIOS[crop.ratio];
+  if (!r) return { x: 0, y: 0, w: W, h: H };
+  let w = W, h = Math.round(W / r);
+  if (h > H) { h = H; w = Math.round(H * r); }
+  const x = Math.round(clamp(crop.cx * W - w / 2, 0, W - w));
+  const y = Math.round(clamp(crop.cy * H - h / 2, 0, H - h));
+  return { x, y, w, h };
+}
+
+/** Draws `src` rotated (quarter turns) and flipped, then optionally cropped. Returns a canvas. */
+function renderGeometry(src, tools, cropped) {
+  const sw = src.width, sh = src.height, rot = tools.rotate & 3;
+  const W = rot % 2 ? sh : sw, H = rot % 2 ? sw : sh;
+  const full = makeCanvas(W, H), c = ctx2d(full);
+  c.imageSmoothingQuality = 'high';
+  c.translate(W / 2, H / 2);
+  if (tools.flipH) c.scale(-1, 1);           // flip in screen space (after rotation)
+  c.rotate(rot * Math.PI / 2);               // positive = clockwise
+  c.drawImage(src, -sw / 2, -sh / 2);
+  if (!cropped || !RATIOS[tools.crop.ratio]) return full;
+  const r = cropRect(W, H, tools.crop);
+  const out = makeCanvas(r.w, r.h);
+  ctx2d(out).drawImage(full, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+  full.width = full.height = 0;              // free memory early (helps on iOS)
+  return out;
+}
+
+/** Preview pixels after geometry. mode 'cropped' (normal) or 'full' (while cropping). Cached. */
+function getBase(mode) {
+  const t = state.tools, cr = t.crop;
+  const key = mode === 'full' ? `${t.rotate}|${t.flipH}`
+    : `${t.rotate}|${t.flipH}|${cr.ratio}|${cr.cx.toFixed(4)}|${cr.cy.toFixed(4)}`;
+  const hit = baseCache[mode];
+  if (hit && hit.key === key) return hit;
+  const canvas = renderGeometry(img.preview, t, mode === 'cropped');
+  const data = ctx2d(canvas).getImageData(0, 0, canvas.width, canvas.height);
+  return (baseCache[mode] = { key, canvas, data });
+}
+
+/* =====================================================================
+   5. LOAD IMAGE  (respects EXIF orientation)
+   ===================================================================== */
+
+async function decodeOriented(file) {
+  // Preferred: decode straight to a bitmap with the camera's rotation applied.
+  if ('createImageBitmap' in window) {
+    try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); }
+    catch (e) { /* older Safari: fall through */ }
+  }
+  // Fallback: an <img> element. Modern browsers apply EXIF orientation to images by default.
+  const url = URL.createObjectURL(file);
+  try {
+    const el = new Image();
+    el.src = url;
+    await el.decode();
+    const c = makeCanvas(el.naturalWidth, el.naturalHeight);
+    ctx2d(c).drawImage(el, 0, 0);
+    return c;
+  } finally { URL.revokeObjectURL(url); }
+}
+
+function makePreview(src) {
+  const s = Math.min(1, PREVIEW_MAX / Math.max(src.width, src.height));
+  const c = makeCanvas(Math.max(1, Math.round(src.width * s)), Math.max(1, Math.round(src.height * s)));
+  const x = ctx2d(c);
+  x.imageSmoothingQuality = 'high';
+  x.drawImage(src, 0, 0, c.width, c.height);
+  return c;
+}
+
+async function loadImage(file) {
+  if (!file) return;
+  setBusy(true, 'Opening photo…');
+  await nextFrame();
+  try {
+    const full = await decodeOriented(file);
+    if (img && img.full && img.full.close) img.full.close();
+    img = { full, preview: makePreview(full), name: (file.name || 'photo').replace(/\.[^.]+$/, '') };
+    state.params = { ...DEFAULT_PARAMS };
+    state.tools = clone(DEFAULT_TOOLS);
+    state.look = 'original';
+    state.history = []; state.index = -1;
+    baseCache = {}; outCache = null;
+    commit();
+    document.body.classList.add('has-image');
+    $('dropzone').hidden = true;
+    $('view').hidden = false;
+    syncUI();
+    render();
+    renderThumbs();
+  } catch (e) {
+    console.error(e);
+    toast("Couldn't open that photo. Try a JPEG or PNG.");
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* =====================================================================
+   6. RENDER
+   ===================================================================== */
+
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; render(); });
+}
+
+function render() {
+  if (!img) return;
+  const mode = activeTab === 'crop' ? 'full' : 'cropped';
+  const base = getBase(mode);
+  let out;
+  if (comparing) {
+    out = base.data;
+  } else {
+    const key = JSON.stringify(state.params);
+    if (!outCache || outCache.base !== base || outCache.key !== key) {
+      outCache = { base, key, data: applyAdjustments(base.data, state.params) };
+    }
+    out = outCache.data;
+  }
+  const view = $('view');
+  if (view.width !== out.width || view.height !== out.height) { view.width = out.width; view.height = out.height; }
+  view.getContext('2d').putImageData(out, 0, 0);
+  $('badge').hidden = !comparing;
+  updateCropBox();
+  if (mode === 'cropped' && thumbsKey !== base.key) scheduleThumbs();
+}
+
+/* Small square previews of each look, made from the current (cropped) photo. */
+let thumbsKey = null, thumbsTimer = 0;
+function scheduleThumbs() { clearTimeout(thumbsTimer); thumbsTimer = setTimeout(renderThumbs, 120); }
+function renderThumbs() {
+  if (!img) return;
+  const base = getBase('cropped');
+  thumbsKey = base.key;
+  const S = 144, sq = makeCanvas(S, S), c = ctx2d(sq);
+  const side = Math.min(base.canvas.width, base.canvas.height);
+  c.imageSmoothingQuality = 'high';
+  c.drawImage(base.canvas, (base.canvas.width - side) / 2, (base.canvas.height - side) / 2, side, side, 0, 0, S, S);
+  const small = c.getImageData(0, 0, S, S);
+  for (const look of LOOKS) {
+    const cv = document.querySelector(`.look[data-look="${look.id}"] canvas`);
+    cv.width = cv.height = S;
+    cv.getContext('2d').putImageData(applyAdjustments(small, paramsForLook(look.id)), 0, 0);
+  }
+}
+
+/* =====================================================================
+   7. HISTORY  (undo / redo of slider + tool state, never pixels)
+   ===================================================================== */
+
+function snapshot() { return JSON.stringify({ params: state.params, tools: state.tools, look: state.look }); }
+
+function commit() {
+  const s = snapshot();
+  if (state.history[state.index] === s) return;
+  state.history = state.history.slice(0, state.index + 1);
+  state.history.push(s);
+  if (state.history.length > HISTORY_LIMIT) state.history.shift();
+  state.index = state.history.length - 1;
+  updateHistoryButtons();
+}
+
+function restore(s) {
+  const o = JSON.parse(s);
+  state.params = o.params; state.tools = o.tools; state.look = o.look;
+  syncUI(); scheduleRender();
+}
+function undo() { if (state.index > 0) { restore(state.history[--state.index]); updateHistoryButtons(); } }
+function redo() { if (state.index < state.history.length - 1) { restore(state.history[++state.index]); updateHistoryButtons(); } }
+function updateHistoryButtons() {
+  $('undo').disabled = state.index <= 0;
+  $('redo').disabled = state.index >= state.history.length - 1;
+}
+
+/* =====================================================================
+   8. UI BINDINGS
+   ===================================================================== */
+
+function $(id) { return document.getElementById(id); }
+// Let the browser paint (e.g. the spinner) before heavy work. The timer fallback matters when the
+// tab is in the background, where requestAnimationFrame is paused.
+function nextFrame() {
+  return new Promise(resolve => {
+    let done = false;
+    const go = () => { if (!done) { done = true; resolve(); } };
+    requestAnimationFrame(() => setTimeout(go, 0));
+    setTimeout(go, 100);
+  });
+}
+
+function setBusy(on, text) {
+  $('busy').hidden = !on;
+  if (text) $('busyText').textContent = text;
+  $('save').disabled = on;
+}
+
+let toastTimer = 0;
+function toast(text, action) {
+  const t = $('toast');
+  t.querySelectorAll('button').forEach(b => b.remove());
+  $('toastText').textContent = text;
+  if (action) {
+    const b = document.createElement('button');
+    b.className = 'btn'; b.textContent = action.label;
+    b.onclick = () => { action.onClick(); t.hidden = true; };
+    t.appendChild(b);
+  }
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, action ? 8000 : 2600);
+}
+
+/* --- Build sliders --- */
+function buildSliders() {
+  const titles = { light: 'Light', color: 'Color', detail: 'Detail', effects: 'Effects' };
+  for (const [tab, key, label, min, max] of SLIDERS) {
+    const pane = document.querySelector(`[data-pane="${tab}"]`);
+    if (!pane.childElementCount) pane.insertAdjacentHTML('beforeend', `<div class="group-title">${titles[tab]}</div>`);
+    const row = document.createElement('div');
+    row.className = 'slider'; row.dataset.key = key;
+    row.innerHTML = `
+      <div class="slider-head">
+        <label for="s-${key}">${label}</label>
+        <output id="o-${key}">0</output>
+        <button class="reset" title="Reset ${label}" aria-label="Reset ${label}">↺</button>
+      </div>
+      <input type="range" id="s-${key}" min="${min}" max="${max}" step="1" value="0">`;
+    pane.appendChild(row);
+    const input = row.querySelector('input');
+    input.addEventListener('input', () => {
+      state.params[key] = +input.value;
+      state.look = null;
+      syncSlider(key); syncLooks();
+      scheduleRender();
+    });
+    input.addEventListener('change', commit);             // fires when the finger/mouse is released
+    const reset = () => {
+      if (state.params[key] === 0) return;
+      state.params[key] = 0; state.look = null;
+      syncSlider(key); syncLooks(); commit(); scheduleRender();
+    };
+    input.addEventListener('dblclick', reset);
+    row.querySelector('.reset').addEventListener('click', reset);
+  }
+}
+
+function syncSlider(key) {
+  const v = state.params[key];
+  $('s-' + key).value = v;
+  $('o-' + key).textContent = v > 0 && key !== 'sharpness' && key !== 'vignette' && key !== 'grain' ? '+' + v : v;
+  $('s-' + key).closest('.slider').classList.toggle('changed', v !== 0);
+}
+function syncLooks() {
+  document.querySelectorAll('.look').forEach(b => b.classList.toggle('active', b.dataset.look === state.look));
+}
+function syncUI() {
+  for (const [, key] of SLIDERS) syncSlider(key);
+  syncLooks();
+  document.querySelectorAll('#ratios .btn').forEach(b => b.classList.toggle('selected', b.dataset.ratio === state.tools.crop.ratio));
+  $('flipH').classList.toggle('selected', state.tools.flipH);
+}
+
+/* --- Looks --- */
+function buildLooks() {
+  const wrap = $('looks');
+  for (const look of LOOKS) {
+    const b = document.createElement('button');
+    b.className = 'look'; b.dataset.look = look.id;
+    b.innerHTML = `<canvas width="1" height="1"></canvas><span>${look.name}</span>`;
+    b.addEventListener('click', () => applyPreset(look.id));
+    wrap.appendChild(b);
+  }
+}
+
+/* --- Tabs --- */
+function setTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.setAttribute('aria-selected', String(t.dataset.tab === tab)));
+  document.querySelectorAll('[data-pane]').forEach(p => { p.hidden = p.dataset.pane !== tab; });
+  scheduleRender();   // the crop tab shows the whole photo with a frame on top
+}
+
+/* --- Crop overlay --- */
+function updateCropBox() {
+  const box = $('cropBox');
+  const show = img && activeTab === 'crop' && !comparing;
+  box.hidden = !show;
+  if (!show) return;
+  const view = $('view'), vr = view.getBoundingClientRect(), sr = $('stage').getBoundingClientRect();
+  const r = cropRect(view.width, view.height, state.tools.crop);
+  const sx = vr.width / view.width, sy = vr.height / view.height;
+  Object.assign(box.style, {
+    left: (vr.left - sr.left + r.x * sx) + 'px', top: (vr.top - sr.top + r.y * sy) + 'px',
+    width: (r.w * sx) + 'px', height: (r.h * sy) + 'px',
+  });
+  box.classList.toggle('fixed', !RATIOS[state.tools.crop.ratio]);
+}
+
+function bindCropDrag() {
+  const box = $('cropBox');
+  let drag = null;
+  box.addEventListener('pointerdown', e => {
+    if (!RATIOS[state.tools.crop.ratio]) return;
+    const view = $('view'), r = cropRect(view.width, view.height, state.tools.crop);
+    // Start from the frame's real (clamped) centre so there is no "dead" drag distance.
+    drag = { x: e.clientX, y: e.clientY,
+      cx: (r.x + r.w / 2) / view.width, cy: (r.y + r.h / 2) / view.height,
+      hw: r.w / view.width / 2, hh: r.h / view.height / 2 };
+    box.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  box.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const vr = $('view').getBoundingClientRect();
+    state.tools.crop.cx = clamp(drag.cx + (e.clientX - drag.x) / vr.width, drag.hw, 1 - drag.hw);
+    state.tools.crop.cy = clamp(drag.cy + (e.clientY - drag.y) / vr.height, drag.hh, 1 - drag.hh);
+    updateCropBox();
+  });
+  const end = () => { if (drag) { drag = null; commit(); scheduleThumbs(); } };
+  box.addEventListener('pointerup', end);
+  box.addEventListener('pointercancel', end);
+}
+
+/* --- Tools --- */
+function rotate(dir) {
+  state.tools.rotate = (state.tools.rotate + dir + 4) & 3;
+  commit(); scheduleRender();
+}
+function flip() {
+  state.tools.flipH = !state.tools.flipH;
+  commit(); syncUI(); scheduleRender();
+}
+function setRatio(ratio) {
+  state.tools.crop = { ratio, cx: 0.5, cy: 0.5 };
+  commit(); syncUI(); scheduleRender();
+}
+function resetAll() {
+  state.params = { ...DEFAULT_PARAMS };
+  state.tools = clone(DEFAULT_TOOLS);
+  state.look = 'original';
+  commit(); syncUI(); scheduleRender();
+}
+
+/* --- Wire everything up --- */
+function bindUI() {
+  buildLooks();
+  buildSliders();
+
+  $('file').addEventListener('change', e => { loadImage(e.target.files[0]); e.target.value = ''; });
+
+  // Drag & drop (desktop)
+  const stage = $('stage'), dz = $('dropzone');
+  stage.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('over'); });
+  stage.addEventListener('dragleave', () => dz.classList.remove('over'));
+  stage.addEventListener('drop', e => {
+    e.preventDefault(); dz.classList.remove('over');
+    const f = [...e.dataTransfer.files].find(f => f.type.startsWith('image/')) || e.dataTransfer.files[0];
+    loadImage(f);
+  });
+
+  document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => setTab(t.dataset.tab)));
+  $('undo').addEventListener('click', undo);
+  $('redo').addEventListener('click', redo);
+  $('rotL').addEventListener('click', () => rotate(-1));
+  $('rotR').addEventListener('click', () => rotate(1));
+  $('flipH').addEventListener('click', flip);
+  document.querySelectorAll('#ratios .btn').forEach(b => b.addEventListener('click', () => setRatio(b.dataset.ratio)));
+  $('resetAll').addEventListener('click', resetAll);
+  $('save').addEventListener('click', exportJpeg);
+  $('quality').addEventListener('input', e => { $('qualityOut').textContent = Math.round(e.target.value * 100); });
+
+  // Hold to compare: show the unedited photo only while pressed.
+  const cmp = $('compare');
+  const press = on => e => {
+    if (on) { e.preventDefault(); if (e.pointerId !== undefined) cmp.setPointerCapture(e.pointerId); }
+    if (comparing === on) return;
+    comparing = on; cmp.classList.toggle('active', on); render();
+  };
+  cmp.addEventListener('pointerdown', press(true));
+  ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(ev => cmp.addEventListener(ev, press(false)));
+  cmp.addEventListener('contextmenu', e => e.preventDefault());
+  cmp.addEventListener('keydown', e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); press(true)(e); } });
+  cmp.addEventListener('keyup', press(false));
+
+  bindCropDrag();
+
+  // Keyboard: Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z (or Ctrl+Y) = redo.
+  document.addEventListener('keydown', e => {
+    if (!img || !(e.ctrlKey || e.metaKey)) return;
+    const k = e.key.toLowerCase();
+    if (k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+    else if ((k === 'z' && e.shiftKey) || k === 'y') { e.preventDefault(); redo(); }
+  });
+
+  new ResizeObserver(() => updateCropBox()).observe(stage);
+}
+
+/* =====================================================================
+   9. EXPORT  (full resolution JPEG)
+   ===================================================================== */
+
+const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+/** Renders the full-resolution photo with every edit and returns a JPEG Blob. */
+async function renderFullJpeg(quality) {
+  let src = img.full;
+  const px = src.width * src.height;
+  if (px > MAX_EXPORT_PIXELS) {                       // very large photos: shrink just enough to fit
+    const s = Math.sqrt(MAX_EXPORT_PIXELS / px);
+    const c = makeCanvas(Math.floor(src.width * s), Math.floor(src.height * s));
+    const x = ctx2d(c); x.imageSmoothingQuality = 'high'; x.drawImage(src, 0, 0, c.width, c.height);
+    src = c;
+  }
+  const geo = renderGeometry(src, state.tools, true);
+  const c = ctx2d(geo);
+  const pixels = c.getImageData(0, 0, geo.width, geo.height);
+  const detailScale = Math.max(src.width, src.height) / Math.max(img.preview.width, img.preview.height);
+  c.putImageData(applyAdjustments(pixels, state.params, { detailScale }), 0, 0);
+  const blob = await new Promise((res, rej) => geo.toBlob(b => b ? res(b) : rej(new Error('encode failed')), 'image/jpeg', quality));
+  const info = { width: geo.width, height: geo.height, downscaled: src !== img.full };
+  geo.width = geo.height = 0;
+  if (src !== img.full) src.width = src.height = 0;
+  return { blob, info };
+}
+
+async function exportJpeg() {
+  if (!img) return;
+  setBusy(true, 'Saving full-size photo…');
+  await nextFrame();
+  try {
+    const { blob, info } = await renderFullJpeg(+$('quality').value);
+    saveBlob(blob, img.name + '-edited.jpg', info);
+  } catch (e) {
+    console.error(e);
+    toast("Sorry, couldn't save this photo.");
+  } finally {
+    setBusy(false);
+  }
+}
+
+function saveBlob(blob, filename, info) {
+  const url = URL.createObjectURL(blob);
+  const openInTab = () => { if (!window.open(url, '_blank')) location.href = url; };
+  try {
+    const a = document.createElement('a');
+    if (!('download' in a)) throw new Error('no download support');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    const size = `${info.width}×${info.height}${info.downscaled ? ' (resized for this device)' : ''}`;
+    if (isIOS) {
+      // iOS sometimes ignores downloads (e.g. home-screen apps): offer the image in a new tab,
+      // where a long-press gives "Save to Photos".
+      toast(`Saved ${size}.`, { label: 'Open image', onClick: openInTab });
+    } else {
+      toast(`Saved ${filename} · ${size}`);
+    }
+  } catch (e) {
+    openInTab();
+    toast('Long-press the image to save it.');
+  }
+  setTimeout(() => URL.revokeObjectURL(url), 120000);
+}
+
+bindUI();
+</script>
+</body>
+</html>
